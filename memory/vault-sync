@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Pull, commit and push a list of plain git repos, so notes, memory and skills stay in step across machines.
+#
+#   vault-sync [REPO ...]
+#
+# With no arguments, reads one repo path per line from ${VAULT_SYNC_REPOS:-~/.config/vault-sync/repos}.
+# Set VAULT_SYNC_AFTER to a command to run once all repos are synced (for example "qmd update && qmd embed").
+set -uo pipefail
+
+if [ "$#" -gt 0 ]; then
+  REPOS=("$@")
+else
+  LIST="${VAULT_SYNC_REPOS:-$HOME/.config/vault-sync/repos}"
+  [ -f "$LIST" ] || { echo "no repos given and $LIST not found" >&2; exit 1; }
+  REPOS=()
+  while IFS= read -r line; do
+    line="${line%%#*}"; line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] && REPOS+=("${line/#\~/$HOME}")
+  done < "$LIST"
+fi
+
+# A dead connection (suspend, wifi change) can block git's HTTP transport forever, and a
+# blocked oneshot service stops its timer from firing. Abort slow transfers and hard-kill hangs.
+GIT_NET=(git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60)
+export GIT_TERMINAL_PROMPT=0
+if command -v timeout >/dev/null 2>&1; then TO=(timeout -k 10 300)
+elif command -v gtimeout >/dev/null 2>&1; then TO=(gtimeout -k 10 300)
+else TO=(); fi
+net() { "${TO[@]+"${TO[@]}"}" "${GIT_NET[@]}" "$@"; }
+
+status=0
+for r in "${REPOS[@]}"; do
+  [ -d "$r/.git" ] || { echo "skip (not a git repo): $r"; continue; }
+  net -C "$r" pull --rebase --autostash --quiet || { echo "warn: pull failed in $r"; status=1; }
+  # A conflicting autostash still exits 0. Committing now would commit conflict markers.
+  if [ -n "$(git -C "$r" ls-files --unmerged)" ]; then
+    echo "FAIL: merge conflict in $r; resolve it by hand. Nothing committed." >&2
+    status=1
+    continue
+  fi
+  git -C "$r" add -A
+  if ! git -C "$r" diff --cached --quiet; then
+    git -C "$r" commit -m "sync $(date +%F-%H%M)" >/dev/null
+  fi
+  net -C "$r" push --quiet || { echo "warn: push failed in $r"; status=1; }
+done
+
+if [ -n "${VAULT_SYNC_AFTER:-}" ]; then
+  sh -c "$VAULT_SYNC_AFTER" || status=1
+fi
+exit "$status"

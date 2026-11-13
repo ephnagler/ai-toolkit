@@ -1,0 +1,201 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# claude-time: active hours with Claude, per project, from Claude Code session logs.
+
+require "date"
+require "json"
+require "optparse"
+require "set"
+require "time"
+
+CLAUDE_PROJECTS = File.expand_path("~/.claude/projects")
+CONFIG_PATH = File.expand_path(ENV.fetch("CLAUDE_TIME_CONFIG", "~/.config/claude-time/config.json"))
+DEFAULT_GAP = 10
+
+def load_config
+  return {} unless File.exist?(CONFIG_PATH)
+  JSON.parse(File.read(CONFIG_PATH))
+rescue JSON::ParserError => e
+  warn "claude-time: ignoring #{CONFIG_PATH}: #{e.message}"
+  {}
+end
+
+def parse_args(argv)
+  opts = { filters: {} }
+  OptionParser.new do |o|
+    o.banner = "Usage: claude-time [range] [--gap MINUTES] [--json]\n       claude-time config"
+    %i[today week month quarter year lastyear].each do |r|
+      o.on("--#{r}") { opts[:filters][r] = true }
+    end
+    o.on("--since DATE") { |d| opts[:filters][:since] = Date.parse(d) }
+    o.on("--until DATE") { |d| opts[:filters][:until] = Date.parse(d) }
+    o.on("--gap MINUTES", Integer, "Pause that ends a stretch of activity (default #{DEFAULT_GAP})") { |g| opts[:gap] = g }
+    o.on("--json", "Print JSON instead of a table") { opts[:json] = true }
+  end.parse!(argv)
+  opts[:command] = argv.shift || "time"
+  opts
+end
+
+# Time between consecutive messages counts only when the gap is short; a longer pause means you were away.
+def active_seconds(timestamps, gap_minutes)
+  limit = gap_minutes * 60
+  timestamps.each_cons(2).sum { |a, b| (b - a) <= limit ? (b - a) : 0 }
+end
+
+def session_from_jsonl(path, gap)
+  stamps = []
+  File.foreach(path) do |line|
+    rec = JSON.parse(line) rescue next
+    next unless %w[user assistant].include?(rec["type"]) && rec["timestamp"]
+    stamps << (Time.parse(rec["timestamp"]) rescue next)
+  end
+  return nil if stamps.size < 2
+  stamps.sort!
+  { start: stamps.first, end: stamps.last, seconds: active_seconds(stamps, gap), messages: stamps.size }
+end
+
+def sessions_from_claude_ai(path, gap, config)
+  mapping = config["conversation_projects"] || {}
+  JSON.parse(File.read(path)).filter_map do |conv|
+    msgs = conv["chat_messages"] || []
+    stamps = msgs.filter_map { |m| Time.parse(m["created_at"]) rescue nil }.sort
+    next if stamps.size < 2
+
+    name = mapping[conv["uuid"]]
+    name ||= msgs.find { |m| m["sender"] == "human" }&.dig("text")&.match(/\Aproject:\s*(\S+)/i)&.[](1)
+    name ||= conv.dig("project", "name") if conv["project"].is_a?(Hash)
+    [ (name || "claude.ai").downcase,
+      { start: stamps.first, end: stamps.last, seconds: active_seconds(stamps, gap), messages: msgs.size } ]
+  end
+end
+
+# ~/.claude/projects names a folder by its path with "/" turned into "-", so "my-app" and "my/app"
+# encode the same. Resolve against real folder names under each project root, longest first.
+def project_name(encoded, config)
+  home = File.expand_path("~")
+  roots = (config["project_roots"] || ["~/Work"]).map { |r| File.expand_path(r) }
+  roots.sort_by { |r| -r.size }.each do |root|
+    enc_root = root.tr("/", "-")
+    next unless encoded == enc_root || encoded.start_with?("#{enc_root}-")
+    rest = encoded.delete_prefix(enc_root).delete_prefix("-")
+    return File.basename(root).downcase if rest.empty?
+    children = Dir.exist?(root) ? Dir.children(root).select { |d| File.directory?(File.join(root, d)) } : []
+    hit = children.sort_by { |d| -d.size }.find { |d| rest.casecmp?(d) || rest.downcase.start_with?("#{d.downcase}-") }
+    return (hit || rest.split("-").first).downcase
+  end
+  enc_home = home.tr("/", "-")
+  return "~" if encoded == enc_home
+  encoded.delete_prefix(enc_home).delete_prefix("-").downcase
+end
+
+def apply_alias(name, config)
+  (config["project_aliases"] || {})[name] || name
+end
+
+def in_range?(date, f)
+  today = Date.today
+  return false if f[:since] && date < f[:since]
+  return false if f[:until] && date > f[:until]
+  return false if f[:today] && date != today
+  return false if f[:week] && date < today - (today.cwday - 1)
+  return false if f[:month] && (date.year != today.year || date.month != today.month)
+  return false if f[:quarter] && date < Date.new(today.year, ((today.month - 1) / 3) * 3 + 1, 1)
+  return false if f[:year] && date.year != today.year
+  return false if f[:lastyear] && date.year != today.year - 1
+  true
+end
+
+def collect(config, gap, filters)
+  ignored = Set.new(config["ignored_projects"] || [])
+  totals = Hash.new { |h, k| h[k] = { sessions: 0, seconds: 0.0, messages: 0, first: nil, last: nil } }
+  add = lambda do |name, s|
+    name = apply_alias(name, config)
+    return if ignored.include?(name) || !in_range?(s[:start].to_date, filters)
+    t = totals[name]
+    t[:sessions] += 1
+    t[:seconds] += s[:seconds]
+    t[:messages] += s[:messages]
+    t[:first] = s[:start] if t[:first].nil? || s[:start] < t[:first]
+    t[:last] = s[:end] if t[:last].nil? || s[:end] > t[:last]
+  end
+
+  dirs = [CLAUDE_PROJECTS] + (config["extra_session_dirs"] || []).map { |d| File.expand_path(d) }
+  dirs.select { |d| Dir.exist?(d) }.each do |base|
+    pattern = base == CLAUDE_PROJECTS ? File.join(base, "*", "*.jsonl") : File.join(base, "**", "*.jsonl")
+    Dir.glob(pattern).each do |path|
+      next if path.include?("/subagents/")
+      parent = File.basename(File.dirname(path))
+      next if File.dirname(path) == base
+      s = session_from_jsonl(path, gap) or next
+      add.call(project_name(parent, config), s)
+    end
+  end
+
+  (config["claude_ai_exports"] || []).each do |pattern|
+    Dir.glob(File.expand_path(pattern)).each do |path|
+      sessions_from_claude_ai(path, gap, config).each { |name, s| add.call(name, s) }
+    rescue JSON::ParserError, IOError => e
+      warn "claude-time: skipping #{path}: #{e.message}"
+    end
+  end
+  totals
+end
+
+def label(filters)
+  parts = filters.map do |k, v|
+    case k
+    when :since, :until then "#{k} #{v}"
+    when :lastyear then "last year"
+    when :today then "today"
+    else "this #{k}"
+    end
+  end
+  parts.empty? ? "all time" : parts.join(", ")
+end
+
+def render(totals, gap, filters, color)
+  paint = ->(s, code) { color ? "\e[#{code}m#{s}\e[0m" : s }
+  rows = totals.sort_by { |_, t| -t[:seconds] }
+  max = rows.first ? rows.first[1][:seconds] : 1
+  puts paint.call("Time with Claude", "1;36") + paint.call("  gap: #{gap}m | #{label(filters)}", "2")
+  puts
+  table = rows.map do |name, t|
+    range = [t[:first], t[:last]].map { |x| x.strftime("%m/%d") }.uniq.join(" - ")
+    [name, t[:sessions].to_s, format("%.1fh", t[:seconds] / 3600.0), t[:messages].to_s, range, t[:seconds] / max.to_f]
+  end
+  head = %w[Project Sess Active Msgs Range]
+  widths = head.each_index.map { |i| ([head[i]] + table.map { |r| r[i] }).map(&:size).max }
+  line = ->(cells) { cells.each_with_index.map { |c, i| i.between?(1, 3) ? c.rjust(widths[i]) : c.ljust(widths[i]) }.join("  ") }
+  puts paint.call(line.call(head), "1")
+  table.each do |r|
+    code = r[5] > 0.5 ? "1" : (r[5] > 0.15 ? "0" : "2")
+    puts paint.call(line.call(r[0, 5]), code)
+  end
+  puts
+  hours = totals.values.sum { |t| t[:seconds] } / 3600.0
+  puts paint.call("TOTAL", "1;33") + "  #{totals.values.sum { |t| t[:sessions] }} sessions  " +
+       paint.call(format("%.1fh", hours), "1;33") + "  #{totals.values.sum { |t| t[:messages] }} msgs"
+end
+
+opts = parse_args(ARGV)
+config = load_config
+gap = opts[:gap] || config["gap_minutes"] || DEFAULT_GAP
+
+case opts[:command]
+when "config"
+  puts "config: #{CONFIG_PATH}#{File.exist?(CONFIG_PATH) ? "" : " (not found, using defaults)"}"
+  puts JSON.pretty_generate({ "gap_minutes" => gap, "project_roots" => ["~/Work"] }.merge(config))
+when "time"
+  totals = collect(config, gap, opts[:filters])
+  if opts[:json]
+    puts JSON.pretty_generate(totals.transform_values { |t| t.merge(hours: (t[:seconds] / 3600.0).round(2)) })
+  elsif totals.empty?
+    puts "No sessions found."
+  else
+    render(totals, gap, opts[:filters], $stdout.tty?)
+  end
+else
+  warn "claude-time: unknown command #{opts[:command]}"
+  exit 1
+end
